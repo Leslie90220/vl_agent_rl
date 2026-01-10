@@ -1,0 +1,131 @@
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==================== Virtual Environment ====================
+venv/
+ENV/
+env/
+.venv/
+
+# ==================== IDE ====================
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ==================== Jupyter Notebook ====================
+.ipynb_checkpoints/
+*.ipynb
+
+# ==================== Training Outputs ====================
+# Checkpoints and model weights
+code/checkpoints/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Training outputs
+outputs/
+code/outputs/
+
+# WandB logs
+wandb/
+code/wandb/
+
+# ==================== Data Files ====================
+# Large data files (keep .json config files)
+code/data/*.parquet
+code/data/*.arrow
+code/data/*.csv
+*.h5
+*.hdf5
+
+# Search engine corpus (large image files)
+code/search_engine/corpus/
+
+# ==================== Models ====================
+# Downloaded/trained models
+code/models/
+models/
+
+# ==================== Logs ====================
+*.log
+logs/
+*.out
+*.err
+slurm-*.out
+
+# ==================== Cache ====================
+.cache/
+*.cache
+.huggingface/
+hub/
+
+# ==================== OS Files ====================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==================== Temporary Files ====================
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# ==================== Assets (optional - uncomment if needed) ====================
+# code/assets/*.png
+# code/assets/*.jpg
+# code/assets/*.gif
+# code/assets/*.GIF
+
+# ==================== Third Party (optional) ====================
+# Uncomment if you don't want to track third_party
+third_party/
+
+# ==================== Ray ====================
+/tmp/ray/
+ray_results/
+
+# ==================== Misc ====================
+.env
+.env.local
+*.pid
+
+# ==================== Large Files ====================
+# CUDA/cuDNN packages
+*.deb
+*.rpm
+
+# PDF corpus (too large for git)
+code/search_engine/corpus_mmlongdoc_test/
+code/search_engine/corpus/
