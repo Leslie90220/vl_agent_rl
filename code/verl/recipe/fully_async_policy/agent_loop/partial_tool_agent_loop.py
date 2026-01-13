@@ -117,6 +117,12 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
             interaction_kwargs=interaction_kwargs,
         )
 
+        # CRITICAL: Pass raw_prompt_ids to agent_data.extra_fields for multimodal support
+        # In VRAG training, raw_prompt_ids contains pre-computed token IDs with collapsed
+        # image tokens that correctly match the number of images in multi_modal_data.
+        if "raw_prompt_ids" in kwargs and kwargs["raw_prompt_ids"] is not None:
+            agent_data.extra_fields["raw_prompt_ids"] = kwargs["raw_prompt_ids"]
+
         # additional param version record
         agent_data.extra_fields["param_version_start"] = param_version
         agent_data.extra_fields["param_version_end"] = param_version
@@ -169,12 +175,11 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
         """
         add_messages: list[dict[str, Any]] = []
 
-        # CRITICAL: When prompt_ids already has expanded image tokens (from processor),
-        # we should NOT pass image_data to vLLM. vLLM's _qwen2_5_vl_dedup_image_tokens
-        # will collapse the expanded tokens, and then vLLM will re-expand them based on
-        # image_data. However, this can cause mismatches if the image processing differs.
-        image_tokens_expanded = agent_data.extra_fields.get("_image_tokens_expanded", False)
-        image_data_for_vllm = None if image_tokens_expanded else agent_data.image_data
+        # Pass image_data to vLLM for multimodal generation
+        # vLLM will:
+        # 1. Call _qwen2_5_vl_dedup_image_tokens to collapse expanded tokens in prompt_ids
+        # 2. Process image_data to get pixel_values
+        # 3. Re-expand tokens based on actual image dimensions
 
         with simple_timer("generate_sequences", agent_data.metrics):
             # partial interface
@@ -183,7 +188,7 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
                     request_id=agent_data.request_id,
                     prompt_ids=agent_data.prompt_ids,
                     sampling_params=sampling_params,
-                    image_data=image_data_for_vllm,
+                    image_data=agent_data.image_data,
                 )
 
                 if is_cancel:
@@ -205,7 +210,7 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
                     request_id=agent_data.request_id,
                     prompt_ids=agent_data.prompt_ids,
                     sampling_params=sampling_params,
-                    image_data=image_data_for_vllm,
+                    image_data=agent_data.image_data,
                 )
                 response_ids = output.token_ids
                 log_probs = output.log_probs

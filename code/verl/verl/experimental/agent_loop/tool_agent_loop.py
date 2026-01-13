@@ -167,6 +167,12 @@ class ToolAgentLoop(AgentLoopBase):
             interaction_kwargs=interaction_kwargs,
         )
 
+        # CRITICAL: Pass raw_prompt_ids to agent_data.extra_fields for multimodal support
+        # In VRAG training, raw_prompt_ids contains pre-computed token IDs with collapsed
+        # image tokens that correctly match the number of images in multi_modal_data.
+        if "raw_prompt_ids" in kwargs and kwargs["raw_prompt_ids"] is not None:
+            agent_data.extra_fields["raw_prompt_ids"] = kwargs["raw_prompt_ids"]
+
         # State machine loop
         state = AgentState.PENDING
         while state != AgentState.TERMINATED:
@@ -203,7 +209,23 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
-        if self.processor is not None:
+        # CRITICAL FIX: For multimodal inputs with vLLM async mode
+        # 
+        # In VRAG training, raw_prompt (message list) may not be updated across turns,
+        # but multi_modal_data is accumulated. This causes a mismatch:
+        # - raw_prompt may have 1 image placeholder
+        # - multi_modal_data may have 2+ images
+        # 
+        # Solution: Use raw_prompt_ids (pre-computed token IDs with collapsed image tokens)
+        # instead of re-tokenizing raw_prompt. The raw_prompt_ids already has the correct
+        # number of image placeholders that match multi_modal_data.
+        
+        # Check if raw_prompt_ids is available (from VRAG training loop)
+        if "raw_prompt_ids" in agent_data.extra_fields and agent_data.extra_fields["raw_prompt_ids"] is not None:
+            # Use pre-computed raw_prompt_ids (already has correct image token count)
+            agent_data.prompt_ids = list(agent_data.extra_fields["raw_prompt_ids"])
+        elif self.processor is not None and agent_data.image_data is not None:
+            # Fallback: Use processor to get prompt_ids with expanded image tokens
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
@@ -214,11 +236,29 @@ class ToolAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            model_inputs = self.processor(text=[raw_prompt], images=agent_data.image_data, return_tensors="pt")
-            agent_data.prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
-            # Mark that we've expanded image tokens via processor
-            # This means we should NOT pass image_data to vLLM for generation
-            agent_data.extra_fields["_image_tokens_expanded"] = True
+            # processor() will expand image tokens based on image dimensions
+            # _qwen2_5_vl_dedup_image_tokens in vLLM will collapse them back
+            model_inputs = await self.loop.run_in_executor(
+                None,
+                lambda: self.processor(text=[raw_prompt], images=agent_data.image_data, return_tensors="pt"),
+            )
+            agent_data.prompt_ids = model_inputs["input_ids"].squeeze(0).tolist()
+        elif self.processor is not None:
+            # Text-only with processor
+            raw_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: self.processor.apply_chat_template(
+                    agent_data.messages,
+                    tools=self.tool_schemas,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            agent_data.prompt_ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.encode(raw_prompt, add_special_tokens=False),
+            )
         else:
             agent_data.prompt_ids = await self.loop.run_in_executor(
                 None,
@@ -238,19 +278,18 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
-        # CRITICAL: When prompt_ids already has expanded image tokens (from processor),
-        # we should NOT pass image_data to vLLM. vLLM's _qwen2_5_vl_dedup_image_tokens
-        # will collapse the expanded tokens, and then vLLM will re-expand them based on
-        # image_data. However, this can cause mismatches if the image processing differs.
-        image_tokens_expanded = agent_data.extra_fields.get("_image_tokens_expanded", False)
-        image_data_for_vllm = None if image_tokens_expanded else agent_data.image_data
+        # Pass image_data to vLLM for multimodal generation
+        # vLLM will:
+        # 1. Call _qwen2_5_vl_dedup_image_tokens to collapse expanded tokens in prompt_ids
+        # 2. Process image_data to get pixel_values
+        # 3. Re-expand tokens based on actual image dimensions
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=agent_data.prompt_ids,
                 sampling_params=sampling_params,
-                image_data=image_data_for_vllm,
+                image_data=agent_data.image_data,
             )
 
         agent_data.assistant_turns += 1

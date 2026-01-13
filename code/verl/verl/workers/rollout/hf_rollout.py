@@ -105,6 +105,30 @@ class HFRollout(BaseRollout):
         self.module.eval()
         param_ctx = contextlib.nullcontext()
 
+        # Extract multimodal data from meta_info if available
+        pixel_values = prompts.meta_info.get("pixel_values", None)
+        image_grid_thw = prompts.meta_info.get("image_grid_thw", None)
+        
+        # Prepare multimodal kwargs for model.generate()
+        multimodal_kwargs = {}
+        if pixel_values is not None:
+            # Move pixel_values to the same device as input_ids
+            device = idx.device
+            if not isinstance(pixel_values, torch.Tensor):
+                pixel_values = torch.tensor(pixel_values)
+            pixel_values = pixel_values.to(device=device, dtype=torch.bfloat16)
+            multimodal_kwargs["pixel_values"] = pixel_values
+            
+            if image_grid_thw is not None:
+                if not isinstance(image_grid_thw, torch.Tensor):
+                    image_grid_thw = torch.tensor(image_grid_thw)
+                image_grid_thw = image_grid_thw.to(device=device)
+                multimodal_kwargs["image_grid_thw"] = image_grid_thw
+            
+            print(f"[HFRollout] Passing multimodal data to model.generate():")
+            print(f"  pixel_values shape: {pixel_values.shape}")
+            print(f"  image_grid_thw shape: {image_grid_thw.shape if image_grid_thw is not None else 'None'}")
+
         if isinstance(self.module, FSDP):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
@@ -121,6 +145,7 @@ class HFRollout(BaseRollout):
                 output_scores=False,  # this is potentially very large
                 return_dict_in_generate=True,
                 use_cache=True,
+                **multimodal_kwargs,  # Pass pixel_values and image_grid_thw if available
             )
 
         # TODO: filter out the seq with no answers like ds-chat

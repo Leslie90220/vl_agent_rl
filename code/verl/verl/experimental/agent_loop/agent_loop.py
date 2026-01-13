@@ -566,34 +566,59 @@ class AgentLoopWorkerBase:
                 # because np.array() only keeps the keys for BatchFeature.
                 multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
         
+        # Check if we're using collapsed prompt_ids (from VRAG training with raw_prompt_ids)
+        using_collapsed_prompt_ids = output.extra_fields.get("using_collapsed_prompt_ids", False)
+        
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-            # For Qwen2-VL models, ALWAYS compute 3D position_ids for consistency
+            # For Qwen2-VL models, compute 3D position_ids for consistency
             # This ensures all samples (text-only and multimodal) have the same position_ids dimension
             # which is required for DataProto.concat across workers
             from verl.models.transformers.qwen2_vl import get_rope_index
 
-            # Get image/video grid info if available
-            image_grid_thw = multi_modal_inputs.get("image_grid_thw") if multi_modal_inputs else None
-            video_grid_thw = multi_modal_inputs.get("video_grid_thw") if multi_modal_inputs else None
-            second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts") if multi_modal_inputs else None
-
             input_ids_1d = input_ids.squeeze(0)
             attention_mask_1d = attention_mask.squeeze(0)
             
-            vision_position_ids = get_rope_index(
-                self.processor,
-                input_ids=input_ids_1d,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                attention_mask=attention_mask_1d,
-            ).unsqueeze(0)  # (1, 3, seq_len)
+            # CRITICAL FIX: When using collapsed prompt_ids (from raw_prompt_ids),
+            # the image tokens are collapsed (1 token per image), but image_grid_thw
+            # expects expanded tokens. In this case, skip get_rope_index and use
+            # simple sequential position_ids.
+            if using_collapsed_prompt_ids:
+                # Use simple sequential position_ids for collapsed prompt_ids
+                # This avoids the mismatch between collapsed image tokens and image_grid_thw
+                valid_mask = attention_mask_1d.bool()
+                seq_len = len(input_ids_1d)
+                
+                # Create 3D position_ids with simple sequential values
+                vision_position_ids = torch.zeros((3, seq_len), dtype=torch.long)
+                vision_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())  # temporal
+                vision_position_ids[1, valid_mask] = torch.arange(valid_mask.sum().item())  # height
+                vision_position_ids[2, valid_mask] = torch.arange(valid_mask.sum().item())  # width
+                vision_position_ids = vision_position_ids.unsqueeze(0)  # (1, 3, seq_len)
+                
+                text_position_ids = torch.zeros((1, seq_len), dtype=torch.long)
+                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                text_position_ids = text_position_ids.unsqueeze(0)
+                position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
+            else:
+                # Get image/video grid info if available
+                image_grid_thw = multi_modal_inputs.get("image_grid_thw") if multi_modal_inputs else None
+                video_grid_thw = multi_modal_inputs.get("video_grid_thw") if multi_modal_inputs else None
+                second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts") if multi_modal_inputs else None
 
-            valid_mask = attention_mask_1d.bool()
-            text_position_ids = torch.zeros((1, len(input_ids_1d)), dtype=torch.long)
-            text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
-            text_position_ids = text_position_ids.unsqueeze(0)
-            position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
+                vision_position_ids = get_rope_index(
+                    self.processor,
+                    input_ids=input_ids_1d,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
+                    attention_mask=attention_mask_1d,
+                ).unsqueeze(0)  # (1, 3, seq_len)
+
+                valid_mask = attention_mask_1d.bool()
+                text_position_ids = torch.zeros((1, len(input_ids_1d)), dtype=torch.long)
+                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                text_position_ids = text_position_ids.unsqueeze(0)
+                position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
         else:
             position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
         enable_async_reward = (

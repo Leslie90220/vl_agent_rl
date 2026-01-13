@@ -63,19 +63,61 @@ def ndcg(sorted_docs, golden_answer_list):
 
 
 def get_answer_from_predict_str(text):
-    end_tag = '</answer>'
-    start_tag = '<answer>'
+    """Extract answer from model prediction.
     
-    end_pos = text.rfind(end_tag)
-    if end_pos == -1:
-        return None  # 如果没有找到</answer>，返回None
+    在多轮对话中，模型可能输出多个 JSON 对象：
+    - search/crop/ocr 动作的 JSON（answer 为 null）
+    - answer 动作的 JSON（包含实际答案）
     
-    start_pos = text.rfind(start_tag, 0, end_pos)
-    if start_pos == -1:
-        return None  # 如果没有找到<answer>，返回None
+    此函数会遍历所有 JSON 对象，找到最后一个 action == 'answer' 的对象并提取其 answer 字段。
     
-    start_pos += len(start_tag)  # 跳过<answer>标签
-    return text[start_pos:end_pos]
+    Supports JSON format: {"think": "...", "action": "answer", "arguments": {}, "answer": "..."}
+    """
+    import json
+    import re as re_module
+    
+    # 首先移除 <think>...</think> 标签内的内容（Qwen3-VL-Thinking 模型可能输出）
+    text_clean = re_module.sub(r'<think>.*?</think>', '', text, flags=re_module.DOTALL)
+    
+    # 找到所有可能的 JSON 对象
+    found_answers = []
+    
+    # 找到所有 { 的位置
+    start_positions = [i for i, c in enumerate(text_clean) if c == '{']
+    
+    for start_idx in start_positions:
+        try:
+            # 使用括号匹配找到对应的 }
+            brace_count = 0
+            end_idx = -1
+            for i in range(start_idx, len(text_clean)):
+                if text_clean[i] == '{':
+                    brace_count += 1
+                elif text_clean[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i
+                        break
+            
+            if end_idx == -1:
+                continue
+            
+            json_str = text_clean[start_idx:end_idx + 1]
+            parsed = json.loads(json_str)
+            
+            # 检查是否是 answer 动作
+            if parsed.get('action') == 'answer':
+                answer = parsed.get('answer')
+                if answer is not None:
+                    found_answers.append(str(answer))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+    
+    # 返回最后一个找到的答案（因为在多轮对话中，最后的 answer 才是最终答案）
+    if found_answers:
+        return found_answers[-1]
+    
+    return None
 
 
 class LocalRewardModel:
@@ -297,6 +339,7 @@ class RMManager:
         already_print_data_sources = {}
 
         data_eval = []
+        raw_responses = []  # 保存模型的原始输出
         for i in range(len(data)):
             data_item = data[i]
             prompt_ids = data_item.batch['prompts']
@@ -305,13 +348,21 @@ class RMManager:
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
             extra_info = data_item.non_tensor_batch.get('extra_info', None)
-            generated_answer = get_answer_from_predict_str(self.tokenizer.decode(valid_response_ids))
+            
+            # 解码模型的原始输出
+            raw_response = self.tokenizer.decode(valid_response_ids)
+            raw_responses.append(raw_response)
+            
+            generated_answer = get_answer_from_predict_str(raw_response)
             if generated_answer is None:
-                generated_answer = 'Please Judge False'
+                # 如果无法从 JSON 中提取答案，使用原始输出作为 generated_answer
+                # 这样可以在调试时看到模型实际输出了什么
+                generated_answer = f'[RAW OUTPUT] {raw_response[:500]}...' if len(raw_response) > 500 else f'[RAW OUTPUT] {raw_response}'
             data_eval.append(dict(
                 query=extra_info['question'],
                 generated_answer=generated_answer,
-                reference_answer=data_item.non_tensor_batch['reward_model']['ground_truth']
+                reference_answer=data_item.non_tensor_batch['reward_model']['ground_truth'],
+                raw_response=raw_response  # 保存原始输出用于调试
             ))
 
         data_to_be_eval = []
@@ -427,12 +478,14 @@ class RMManager:
                     print(f"[DEBUG RMManager] file_name: {file_name}")
                     print(f"[DEBUG RMManager] reference_page: {reference_page}")
                     print(f"[DEBUG RMManager] data_eval[{i}]: query={data_eval[i]['query'][:100]}...")
-                    print(f"[DEBUG RMManager] data_eval[{i}]: generated_answer={data_eval[i]['generated_answer'][:200] if data_eval[i]['generated_answer'] else 'None'}...")
-                    print(f"[DEBUG RMManager] data_eval[{i}]: reference_answer={data_eval[i]['reference_answer'][:200] if data_eval[i]['reference_answer'] else 'None'}...")
+                    print(f"[DEBUG RMManager] data_eval[{i}]: generated_answer={data_eval[i]['generated_answer'][:] if data_eval[i]['generated_answer'] else 'None'}...")
+                    print(f"[DEBUG RMManager] data_eval[{i}]: reference_answer={data_eval[i]['reference_answer'][:] if data_eval[i]['reference_answer'] else 'None'}...")
+
 
                     old_score = score
-                    score = 0.7 * model_eval_score + 0.1 * score + 0.2 * ndcg_value
-                    print(f"[DEBUG RMManager] final_score: 0.7*{model_eval_score} + 0.1*{old_score} + 0.2*{ndcg_value} = {score}")
+                    #score = 0.7 * model_eval_score + 0.1 * score + 0.2 * ndcg_value
+                    score = 0.4 * model_eval_score + 0.1 * score + 0.5 * ndcg_value
+                    print(f"[DEBUG RMManager] final_score: 0.4*{model_eval_score} + 0.1*{old_score} + 0.5*{ndcg_value} = {score}")
                     print(f"[DEBUG RMManager] =====================================\n")
             else:
                 # DEBUG: 打印被强制回答的sample信息（score=0，即在max_turns结束时被强制回答）
@@ -446,8 +499,12 @@ class RMManager:
                 print(f"[DEBUG RMManager] file_name: {file_name}")
                 print(f"[DEBUG RMManager] reference_page: {reference_page}")
                 print(f"[DEBUG RMManager] data_eval[{i}]: query={data_eval[i]['query'][:100]}...")
-                print(f"[DEBUG RMManager] data_eval[{i}]: generated_answer={data_eval[i]['generated_answer'][:200] if data_eval[i]['generated_answer'] else 'None'}...")
+                print(f"[DEBUG RMManager] data_eval[{i}]: generated_answer={data_eval[i]['generated_answer'][:500] if data_eval[i]['generated_answer'] else 'None'}...")
                 print(f"[DEBUG RMManager] data_eval[{i}]: reference_answer={data_eval[i]['reference_answer'][:200] if data_eval[i]['reference_answer'] else 'None'}...")
+                # 打印模型的完整原始输出
+                print(f"[DEBUG RMManager] ========== Model Raw Output (Sample {i}) ==========")
+                print(f"{data_eval[i].get('raw_response', 'N/A')}")
+                print(f"[DEBUG RMManager] ========== End Raw Output ==========")
                 print(f"[DEBUG RMManager] final_score: {score}")
                 print(f"[DEBUG RMManager] =====================================\n")
 

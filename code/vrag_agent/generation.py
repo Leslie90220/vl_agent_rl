@@ -147,26 +147,92 @@ class LLMGenerationManager:
         
 
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
-        """Process responses to stop at search operation or answer operation."""
+        """Process responses to extract JSON format action.
+        
+        Expected JSON format:
+        {"think": "...", "action": "search|crop|ocr|answer", "arguments": {...}, "answer": null|"..."}
+        """
         
         responses_str = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
         )
 
-        def extract_tags(text):
-            # 定义正则表达式，匹配 <answer>...</answer>、<search>...</search>、<think>...</think> 和 <tools_call>...</tools_call>
-            pattern = r"<(answer|search|think|bbox|tools_call)>(.*?)</\1>"
-            # 使用 findall 方法找到所有匹配的内容
-            matches = re.findall(pattern, text, re.DOTALL)
-            # 将匹配的内容重新组合成字符串
-            result = "\n".join([f"<{tag}>{content}</{tag}>" for tag, content in matches])
-            return result
+        def extract_json_response(text):
+            """Extract and validate JSON response format.
+            
+            处理特殊情况：
+            1. 模型可能输出 <think>...</think> 标签包裹的内容
+            2. 可能有多个 JSON 对象，需要找到第一个有效的
+            """
+            import re as re_module
+            VALID_ACTIONS = {'search', 'crop', 'ocr', 'answer'}
+            
+            # 首先尝试移除 <think>...</think> 标签内的内容
+            # 因为 Qwen3-VL-Thinking 模型可能会在 <think> 标签内输出无效的 JSON
+            text_without_think = re_module.sub(r'<think>.*?</think>', '', text, flags=re_module.DOTALL)
+            
+            # 如果移除后还有内容，优先解析移除后的内容
+            texts_to_try = [text_without_think, text] if text_without_think.strip() else [text]
+            
+            for try_text in texts_to_try:
+                # 找到所有可能的 JSON 对象起始位置
+                start_positions = [i for i, c in enumerate(try_text) if c == '{']
+                
+                for start_idx in start_positions:
+                    try:
+                        # 使用括号匹配找到对应的 }
+                        brace_count = 0
+                        end_idx = -1
+                        for i in range(start_idx, len(try_text)):
+                            if try_text[i] == '{':
+                                brace_count += 1
+                            elif try_text[i] == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end_idx = i
+                                    break
+                        
+                        if end_idx == -1:
+                            continue
+                        
+                        json_str = try_text[start_idx:end_idx + 1]
+                        parsed = json.loads(json_str)
+                        
+                        # 验证必需字段: think, action, arguments, answer
+                        required_fields = ['think', 'action', 'arguments', 'answer']
+                        if not all(key in parsed for key in required_fields):
+                            continue
+                        
+                        # 验证 action 字段值
+                        action = parsed.get('action', '')
+                        if action not in VALID_ACTIONS:
+                            continue
+                        
+                        # 验证 arguments 字段类型
+                        if not isinstance(parsed.get('arguments'), dict):
+                            continue
+                        
+                        return json_str
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        continue
+            
+            return None
 
-        responses_str = [extract_tags(resp) + self.tokenizer.eos_token for resp in responses_str]
+        processed_responses = []
+        for resp in responses_str:
+            json_response = extract_json_response(resp)
+            if json_response:
+                processed_responses.append(json_response + self.tokenizer.eos_token)
+            else:
+                # 如果没有匹配到有效 JSON，保留原始响应
+                # 注意：Qwen3-VL-Thinking 模型可能输出 <think>...</think> 格式
+                # 不要截断，保留完整响应以便后续处理和调试
+                # 增加截断长度到 16384，与 max_response_length 一致
+                processed_responses.append(resp[:16384] + self.tokenizer.eos_token)
 
-        responses = self._batch_tokenize(responses_str)
-        return responses, responses_str
+        responses = self._batch_tokenize(processed_responses)
+        return responses, processed_responses
     #处理观察，构建新的文本和图片上下文结果信息
     def _process_next_obs(self, next_obs: List, rollings) -> torch.Tensor:
         """Process next observations from environment."""
@@ -215,18 +281,19 @@ class LLMGenerationManager:
                             raise ValueError(f"No displayed image available for image_id: {image_id}")
                         
                         displayed_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][image_id - 1]
-                        width, height = displayed_image.size
+                        display_width, display_height = displayed_image.size
                         
                         # 打开原始图片
                         raw_image = Image.open(target_image_path)
                         raw_width, raw_height = raw_image.size
                         
-                        # 坐标映射：从展示图片坐标 → 原始图片坐标
+                        # 坐标映射：region 是归一化坐标 (0-1 范围)，直接映射到原始图片像素坐标
+                        # region = [x1, y1, x2, y2]，其中 x1,y1 是左上角，x2,y2 是右下角
                         crop_area = [
-                            int(raw_width * region[0] / width), 
-                            int(raw_height * region[1] / height), 
-                            int(raw_width * region[2] / width), 
-                            int(raw_height * region[3] / height)
+                            int(raw_width * region[0]),   # x1
+                            int(raw_height * region[1]),  # y1
+                            int(raw_width * region[2]),   # x2
+                            int(raw_height * region[3])   # y2
                         ]
                         crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
                         
@@ -240,9 +307,39 @@ class LLMGenerationManager:
                         img_bytes = img_byte_arr.getvalue()
                 
                         # 调用 OCR API
-                        print(f"  [OCR DEBUG] Calling OCR API for image_{image_id:02d} at region {region}")
+                        print(f"\n{'='*60}")
+                        print(f"  [OCR EXECUTION DEBUG] Sample {idx} - Calling OCR API")
+                        print(f"  [OCR EXECUTION DEBUG] Target: image_{image_id:02d} at region {region}")
+                        print(f"  [OCR EXECUTION DEBUG] Image path: {target_image_path}")
+                        print(f"  [OCR EXECUTION DEBUG] Crop area (mapped): {crop_area}")
+                        print(f"  [OCR EXECUTION DEBUG] Cropped image size: {cropped_image.size}")
+                        
                         ocr_result = call_ocr_api(self.config.ocr_api_url, img_bytes)
-                        print(f"  [OCR DEBUG] OCR result: {ocr_result[:200]}..." if len(ocr_result) > 200 else f"  [OCR DEBUG] OCR result: {ocr_result}")
+                        
+                        # 打印 PaddleOCR 引擎返回的完整内容
+                        print(f"\n  [OCR EXECUTION DEBUG] === PaddleOCR Engine Response ===")
+                        print(f"  [OCR EXECUTION DEBUG] Result length: {len(ocr_result)} characters")
+                        print(f"  [OCR EXECUTION DEBUG] Full OCR result:")
+                        print(f"  {'='*50}")
+                        print(f"  {ocr_result}")
+                        print(f"  {'='*50}")
+                        
+                        # 检查 OCR 是否成功返回内容
+                        ocr_success = True
+                        if not ocr_result:
+                            print(f"  [OCR EXECUTION DEBUG] ✗ OCR returned empty result!")
+                            ocr_success = False
+                        elif ocr_result.startswith("OCR request failed") or ocr_result.startswith("OCR request timed out"):
+                            print(f"  [OCR EXECUTION DEBUG] ✗ OCR API error: {ocr_result}")
+                            ocr_success = False
+                        elif ocr_result == "No text detected in the image.":
+                            print(f"  [OCR EXECUTION DEBUG] ⚠️ OCR detected no text in the cropped region")
+                            ocr_success = True  # 这不是错误，只是没有文本
+                        elif ocr_result == "No text content extracted from the image.":
+                            print(f"  [OCR EXECUTION DEBUG] ⚠️ OCR found blocks but no text content")
+                            ocr_success = True
+                        else:
+                            print(f"  [OCR EXECUTION DEBUG] ✓ OCR successfully extracted text content")
                         
                         # 构建返回给模型的文本（不包含图片）
                         obs_str = f'\n<|im_start|>user\nocr_result_from_image_{image_id:02d}:\n{ocr_result}\n<|im_end|>\n<|im_start|>assistant\n'
@@ -250,9 +347,17 @@ class LLMGenerationManager:
                         multi_modal_data.append({'image': []})
                         multi_modal_inputs.append(BatchFeature(dict()))
                         
+                        # 打印添加到上下文的确认信息
+                        print(f"\n  [OCR EXECUTION DEBUG] === Context Update ===")
+                        print(f"  [OCR EXECUTION DEBUG] ✓ OCR result added to context window")
+                        print(f"  [OCR EXECUTION DEBUG] Context format: ocr_result_from_image_{image_id:02d}:\\n{{ocr_result}}")
+                        print(f"  [OCR EXECUTION DEBUG] obs_str length: {len(obs_str)} characters")
+                        print(f"  [OCR EXECUTION DEBUG] obs_str preview: {obs_str[:150]}...")
+                        print(f"{'='*60}\n")
+                        
                     except Exception as e:
                         print(f"  [OCR ERROR] Failed to perform OCR: {e}")
-                        next_obs_str.append(f'\n<|im_start|>user\nYour OCR action failed: {str(e)}. Please check the image_id and region values and try again.\n<|im_end|>\n<|im_start|>assistant\n')
+                        next_obs_str.append(f'\n<|im_start|>user\nYour OCR action failed: {str(e)}. Please use the correct JSON format:\n\n{{"think": "I need to extract text from...", "action": "ocr", "arguments": {{"image_id": "image_01", "region": [x1, y1, x2, y2]}}, "answer": null}}\n\nPlease try again.\n<|im_end|>\n<|im_start|>assistant\n')
                         multi_modal_data.append({'image': []})
                         multi_modal_inputs.append(BatchFeature(dict()))
                 else:
@@ -274,20 +379,21 @@ class LLMGenerationManager:
                             raise ValueError(f"No displayed image available for image_id: {image_id}")
                     
                         displayed_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][image_id - 1]
-                        width, height = displayed_image.size
+                        display_width, display_height = displayed_image.size
                         
                         # 打开原始图片进行裁剪
                         raw_images_crop = Image.open(target_image_path)
                         raw_width, raw_height = raw_images_crop.size
                         
-                        # 坐标映射：从展示图片坐标 → 原始图片坐标
+                        # 坐标映射：region 是归一化坐标 (0-1 范围)，直接映射到原始图片像素坐标
+                        # region = [x1, y1, x2, y2]，其中 x1,y1 是左上角，x2,y2 是右下角
                         if self.is_validation:
                             region = [region[0]-28, region[1]-28, region[2]+28, region[3]+28]
                         crop_area = [
-                            int(raw_width * region[0] / width), 
-                            int(raw_height * region[1] / height), 
-                            int(raw_width * region[2] / width), 
-                            int(raw_height * region[3] / height)
+                            int(raw_width * region[0]),   # x1
+                            int(raw_height * region[1]),  # y1
+                            int(raw_width * region[2]),   # x2
+                            int(raw_height * region[3])   # y2
                         ]
                         crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
                         
@@ -309,7 +415,7 @@ class LLMGenerationManager:
                         
                     except Exception as e:
                         print(f"  [CROP ERROR] Failed to crop: {e}")
-                        next_obs_str.append(f'\n<|im_start|>user\nYour crop action failed: {str(e)}. Please check the image_id and region values and try again.\n<|im_end|>\n<|im_start|>assistant\n')
+                        next_obs_str.append(f'\n<|im_start|>user\nYour crop action failed: {str(e)}. Please use the correct JSON format:\n\n{{"think": "I need to zoom in on...", "action": "crop", "arguments": {{"image_id": "image_01", "region": [x1, y1, x2, y2]}}, "answer": null}}\n\nPlease try again.\n<|im_end|>\n<|im_start|>assistant\n')
                         multi_modal_data.append({'image': []})
                         multi_modal_inputs.append(BatchFeature(dict()))
             # ret image
@@ -614,6 +720,68 @@ class LLMGenerationManager:
         
         return {'responses': responses[:, :max_len]}
 
+    def _batch_multimodal_inputs(self, multi_modal_inputs: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Batch multimodal inputs from per-sample format to batched tensors.
+        
+        This method extracts pixel_values and image_grid_thw from per-sample
+        multi_modal_inputs and concatenates them into batched tensors that can
+        be passed to the model's generate method.
+        
+        Args:
+            multi_modal_inputs: Array of per-sample multimodal inputs, where each
+                element is a dict containing 'pixel_values' and 'image_grid_thw',
+                or None/empty dict for text-only samples.
+                
+        Returns:
+            Tuple of (batched_pixel_values, batched_image_grid_thw):
+            - batched_pixel_values: Concatenated pixel values tensor, shape 
+              [total_images, channels, height, width], or None if no images
+            - batched_image_grid_thw: Concatenated image grid tensor, shape
+              [total_images, 3], or None if no images
+        """
+        pixel_values_list = []
+        image_grid_thw_list = []
+        
+        for mm_input in multi_modal_inputs:
+            if mm_input is None:
+                continue
+                
+            # Handle different input formats
+            # Priority: BatchFeature (.data attribute) > dict (.get method)
+            pv = None
+            igt = None
+            
+            if hasattr(mm_input, 'data') and isinstance(mm_input.data, dict):
+                # BatchFeature format - check .data first
+                pv = mm_input.data.get('pixel_values', None)
+                igt = mm_input.data.get('image_grid_thw', None)
+            elif hasattr(mm_input, 'get'):
+                # Dict format
+                pv = mm_input.get('pixel_values', None)
+                igt = mm_input.get('image_grid_thw', None)
+            else:
+                continue
+            
+            if pv is not None:
+                # Ensure tensor format
+                if not isinstance(pv, torch.Tensor):
+                    pv = torch.tensor(pv)
+                pixel_values_list.append(pv)
+                
+            if igt is not None:
+                if not isinstance(igt, torch.Tensor):
+                    igt = torch.tensor(igt)
+                image_grid_thw_list.append(igt)
+        
+        if not pixel_values_list:
+            return None, None
+        
+        # Concatenate along the first dimension (total images)
+        batched_pixel_values = torch.cat(pixel_values_list, dim=0)
+        batched_image_grid_thw = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
+        
+        return batched_pixel_values, batched_image_grid_thw
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
@@ -625,6 +793,58 @@ class LLMGenerationManager:
             NOTE: When using agent_loop with n_agent > 1, the total number of workers
             is num_gpus * n_agent, so we need to pad to that total for proper chunking.
         """
+        # === DEBUG: 检查 active_batch 中的多模态数据 ===
+        print(f"\n[GENERATE DEBUG] _generate_with_gpu_padding called")
+        print(f"  Batch size: {active_batch.batch['input_ids'].shape[0]}")
+        print(f"  Input IDs shape: {active_batch.batch['input_ids'].shape}")
+        
+        if 'multi_modal_inputs' in active_batch.non_tensor_batch:
+            mm_inputs = active_batch.non_tensor_batch['multi_modal_inputs']
+            print(f"  multi_modal_inputs count: {len(mm_inputs)}")
+            for idx, mm in enumerate(mm_inputs[:2]):  # 只打印前2个
+                if mm is not None:
+                    if hasattr(mm, 'get'):
+                        pv = mm.get('pixel_values', None)
+                        igt = mm.get('image_grid_thw', None)
+                        print(f"    [Sample {idx}] pixel_values: {pv.shape if pv is not None else 'None'}")
+                        print(f"    [Sample {idx}] image_grid_thw: {igt}")
+                    elif hasattr(mm, 'data') and isinstance(mm.data, dict):
+                        pv = mm.data.get('pixel_values', None)
+                        igt = mm.data.get('image_grid_thw', None)
+                        print(f"    [Sample {idx}] pixel_values (from .data): {pv.shape if pv is not None else 'None'}")
+                        print(f"    [Sample {idx}] image_grid_thw (from .data): {igt}")
+                    else:
+                        print(f"    [Sample {idx}] mm type: {type(mm)}, keys: {mm.keys() if hasattr(mm, 'keys') else 'N/A'}")
+                else:
+                    print(f"    [Sample {idx}] multi_modal_inputs is None")
+        else:
+            print(f"  WARNING: No 'multi_modal_inputs' in non_tensor_batch!")
+            print(f"  Available keys in non_tensor_batch: {list(active_batch.non_tensor_batch.keys())}")
+        
+        if 'multi_modal_data' in active_batch.non_tensor_batch:
+            mm_data = active_batch.non_tensor_batch['multi_modal_data']
+            print(f"  multi_modal_data count: {len(mm_data)}")
+            for idx, mmd in enumerate(mm_data[:2]):
+                if mmd is not None and 'image' in mmd:
+                    print(f"    [Sample {idx}] images count: {len(mmd['image'])}")
+                else:
+                    print(f"    [Sample {idx}] no images")
+        # === END DEBUG ===
+        
+        # === NEW: Batch multimodal inputs and add to meta_info ===
+        if 'multi_modal_inputs' in active_batch.non_tensor_batch:
+            batched_pixel_values, batched_image_grid_thw = self._batch_multimodal_inputs(
+                active_batch.non_tensor_batch['multi_modal_inputs']
+            )
+            if batched_pixel_values is not None:
+                active_batch.meta_info['pixel_values'] = batched_pixel_values
+                active_batch.meta_info['image_grid_thw'] = batched_image_grid_thw
+                print(f"  [MULTIMODAL] Batched pixel_values shape: {batched_pixel_values.shape}")
+                print(f"  [MULTIMODAL] Batched image_grid_thw shape: {batched_image_grid_thw.shape if batched_image_grid_thw is not None else 'None'}")
+            else:
+                print(f"  [MULTIMODAL] No pixel_values found in multi_modal_inputs")
+        # === END NEW ===
+        
         # Calculate total workers: num_gpus * n_agent (for agent_loop chunking compatibility)
         total_workers = self.config.num_gpus * self.config.n_agent
         if total_workers <= 1:
@@ -792,6 +1012,12 @@ class LLMGenerationManager:
         self.image_id_counters = [0 for _ in range(gen_batch.batch['input_ids'].shape[0])]
         # 追踪哪些样本已经找到参考图片（用于调试）
         self._samples_found_reference = set()
+        # 每个样本的连续搜索次数计数器
+        self._search_counters = [0 for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        # 每个样本最近一次的 search query（用于 reminder）
+        self._last_search_queries = ['' for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        # 搜索次数阈值，超过此值后强制模型回答
+        MAX_SEARCH_BEFORE_FORCE_ANSWER = 15
 
         # Main generation loop主循环
         for step in range(self.config.max_turns):
@@ -826,6 +1052,23 @@ class LLMGenerationManager:
                 })
 
             # Step 5: 模型生成响应。调用 vLLM 生成，处理多 GPU padding
+            # === DEBUG: 检查传递给模型的多模态数据 ===
+            if 'multi_modal_inputs' in rollings_active.non_tensor_batch:
+                mm_inputs = rollings_active.non_tensor_batch['multi_modal_inputs']
+                print(f"\n[MULTIMODAL DEBUG] Before generate_sequences:")
+                print(f"  Number of samples with multi_modal_inputs: {len(mm_inputs)}")
+                for idx, mm in enumerate(mm_inputs[:3]):  # 只打印前3个
+                    if mm is not None and hasattr(mm, 'get'):
+                        pv = mm.get('pixel_values', None)
+                        igt = mm.get('image_grid_thw', None)
+                        print(f"  [Sample {idx}] pixel_values shape: {pv.shape if pv is not None else 'None'}")
+                        print(f"  [Sample {idx}] image_grid_thw: {igt if igt is not None else 'None'}")
+                    else:
+                        print(f"  [Sample {idx}] multi_modal_inputs is None or empty")
+            else:
+                print(f"\n[MULTIMODAL DEBUG] WARNING: No multi_modal_inputs in rollings_active.non_tensor_batch!")
+            # === END DEBUG ===
+            
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info   
@@ -843,10 +1086,19 @@ class LLMGenerationManager:
                 action_counts[act] = action_counts.get(act, 0) + 1
             print(f"[ACTION DEBUG] Action distribution: {action_counts}")
             
-            # 打印所有动作类型（answer, search, crop, ocr, None）
+            # 打印所有动作类型（answer, search, crop, ocr, None）及模型完整响应
             for idx, (act, content) in enumerate(zip(cur_actions_debug, contents_debug)):
+                # 获取模型的完整响应
+                full_resp = responses_str[idx] if idx < len(responses_str) else "N/A"
+                
                 if act == 'answer':
+                    print(f"\n{'='*60}")
                     print(f"[ANSWER DEBUG] Sample {idx} answered: {content[:200] if content else 'empty'}")
+                    print(f"[ANSWER DEBUG] Sample {idx} - Model full response:")
+                    print(f"============================ Model full response ============================")
+                    print(f"{full_resp}")
+                    print(f"============================ End of model response ============================")
+                    print(f"{'='*60}\n")
                 elif act == 'search':
                     print(f"[SEARCH DEBUG] Sample {idx} searching: {content if content else 'empty'}")
                 elif act == 'crop':
@@ -854,27 +1106,100 @@ class LLMGenerationManager:
                     if isinstance(content, dict):
                         image_id = content.get('image_id', 'unknown')
                         region = content.get('region', [])
+                        print(f"\n{'='*60}")
                         print(f"[CROP DEBUG] Sample {idx} cropping: image_id={image_id}, region={region}")
                     else:
+                        print(f"\n{'='*60}")
                         print(f"[CROP DEBUG] Sample {idx} cropping: {content}")
+                    print(f"[CROP DEBUG] Sample {idx} - Model full response:")
+                    print(f"============================ Model full response ============================")
+                    print(f"{full_resp}")
+                    print(f"============================ End of model response ============================")
+                    print(f"{'='*60}\n")
                 elif act == 'ocr':
                     # ocr content 是一个 dict，包含 image_id 和 region
+                    print(f"\n{'='*60}")
                     if isinstance(content, dict):
                         image_id = content.get('image_id', 'unknown')
                         region = content.get('region', [])
                         print(f"[OCR DEBUG] Sample {idx} OCR: image_id={image_id}, region={region}")
+                        
+                        # 验证模型输出是否符合规范
+                        print(f"[OCR DEBUG] === Format Validation ===")
+                        
+                        # 检查 image_id 格式
+                        image_id_valid = False
+                        if isinstance(image_id, str):
+                            import re as re_module
+                            image_id_match = re_module.search(r'image_(\d+)', image_id)
+                            if image_id_match:
+                                image_id_valid = True
+                                parsed_id = int(image_id_match.group(1))
+                                print(f"  ✓ image_id format valid: '{image_id}' -> parsed as {parsed_id}")
+                            else:
+                                print(f"  ✗ image_id format INVALID: '{image_id}' (expected format: 'image_01', 'image_1', etc.)")
+                        else:
+                            print(f"  ✗ image_id type INVALID: {type(image_id)} (expected str)")
+                        
+                        # 检查 region 格式
+                        region_valid = False
+                        if isinstance(region, list) and len(region) == 4:
+                            if all(isinstance(coord, (int, float)) and coord >= 0 for coord in region):
+                                region_valid = True
+                                print(f"  ✓ region format valid: {region} (4 non-negative coordinates)")
+                            else:
+                                print(f"  ✗ region values INVALID: {region} (all coordinates must be non-negative numbers)")
+                        else:
+                            print(f"  ✗ region format INVALID: {region} (expected list of 4 coordinates [x1, y1, x2, y2])")
+                        
+                        # 总体验证结果
+                        if image_id_valid and region_valid:
+                            print(f"  ✓ Overall: Model output is VALID for OCR action")
+                        else:
+                            print(f"  ✗ Overall: Model output is INVALID - OCR will likely fail")
                     else:
                         print(f"[OCR DEBUG] Sample {idx} OCR: {content}")
+                        print(f"[OCR DEBUG] === Format Validation ===")
+                        print(f"  ✗ content type INVALID: {type(content)} (expected dict with 'image_id' and 'region')")
+                    
+                    print(f"[OCR DEBUG] Sample {idx} - Model full response:")
+                    print(f"============================ Model full response ============================")
+                    print(f"{full_resp}")
+                    print(f"============================ End of model response ============================")
+                    print(f"{'='*60}\n")
                 elif act is None:
                     # 打印 None 动作的详细信息，帮助诊断问题
-                    resp = responses_str[idx] if idx < len(responses_str) else "N/A"
+                    print(f"\n{'='*60}")
                     print(f"[NONE ACTION DEBUG] Sample {idx} has no valid action!")
-                    print(f"  Response preview: {resp[:300]}...")
-                    # 检查是否有部分标签
-                    has_tools_call = '<tools_call>' in resp
-                    has_search = '<search>' in resp
-                    has_answer = '<answer>' in resp
-                    print(f"  Tags found: <tools_call>={has_tools_call}, <search>={has_search}, <answer>={has_answer}")
+                    print(f"[NONE ACTION DEBUG] Sample {idx} - Model full response:")
+                    print(f"============================ Model full response ============================")
+                    print(f"{full_resp}")
+                    print(f"============================ End of model response ============================")
+                    
+                    # 检查 JSON 格式字段
+                    has_brace = '{' in full_resp
+                    has_action = '"action"' in full_resp
+                    has_think = '"think"' in full_resp
+                    has_arguments = '"arguments"' in full_resp
+                    has_answer = '"answer"' in full_resp
+                    print(f"  JSON fields: brace={has_brace}, action={has_action}, think={has_think}, arguments={has_arguments}, answer={has_answer}")
+                    
+                    # 诊断问题原因
+                    if has_brace and has_action:
+                        # 尝试提取 action 值
+                        import re as re_module
+                        action_match = re_module.search(r'"action"\s*:\s*"([^"]*)"', full_resp)
+                        if action_match:
+                            detected_action = action_match.group(1)
+                            print(f"  ⚠️ DIAGNOSIS: JSON with action='{detected_action}' detected, but parsing failed. Check JSON validity.")
+                        else:
+                            print(f"  ⚠️ DIAGNOSIS: JSON format detected but action value not found.")
+                    elif not has_brace:
+                        print(f"  ⚠️ DIAGNOSIS: No JSON object found. Model may have output plain text or been cut off.")
+                    else:
+                        print(f"  ⚠️ DIAGNOSIS: Incomplete JSON format.")
+                    
+                    print(f"{'='*60}\n")
             
             # === 特别关注：检查哪些样本已经找到参考图片但仍在搜索 ===
             if hasattr(self, '_samples_found_reference'):
@@ -910,8 +1235,10 @@ class LLMGenerationManager:
                                 if extra_info and isinstance(extra_info, dict):
                                     question = extra_info.get('question', '')
                                     if question:
-                                        # 构造强制搜索的响应
-                                        forced_response = f"<think>I need to search for relevant information to answer this question.</think>\n<search>{question}</search>" + self.tokenizer.eos_token
+                                        # 构造强制搜索的响应 - 使用新的 JSON 格式
+                                        # 转义问题中的双引号
+                                        escaped_question = question.replace('\\', '\\\\').replace('"', '\\"')
+                                        forced_response = f'{{"think": "I need to search for relevant information to answer this question.", "action": "search", "arguments": {{"query": "{escaped_question}"}}, "answer": null}}' + self.tokenizer.eos_token
                                         forced_responses_str.append(forced_response)
                                         print(f"  [AUTO SEARCH] Sample {idx}: Forcing search for '{question[:80]}...'")
                                         continue
@@ -924,6 +1251,44 @@ class LLMGenerationManager:
                     responses_str = forced_responses_str
                     responses_ids = self._batch_tokenize(responses_str)
             # === END 第一轮强制搜索 ===
+            
+            # === 搜索次数限制：更新计数器并在超过阈值时强制回答 ===
+            # 更新搜索计数器
+            for idx, act in enumerate(cur_actions_debug):
+                if act == 'search':
+                    self._search_counters[idx] += 1
+                elif act == 'answer':
+                    # 回答后重置计数器
+                    self._search_counters[idx] = 0
+            
+            # 检查是否有样本超过搜索次数限制
+            forced_answer_responses_str = list(responses_str)  # 创建副本
+            has_forced_answer = False
+            for idx in range(len(responses_str)):
+                if self._search_counters[idx] >= MAX_SEARCH_BEFORE_FORCE_ANSWER and cur_actions_debug[idx] == 'search':
+                    # 超过搜索次数限制，强制回答
+                    print(f"\n[FORCE ANSWER] Sample {idx} has searched {self._search_counters[idx]} times, forcing answer...")
+                    
+                    # 获取问题信息
+                    question = ""
+                    if 'extra_info' in rollings.non_tensor_batch and idx < len(rollings.non_tensor_batch['extra_info']):
+                        extra_info = rollings.non_tensor_batch['extra_info'][idx]
+                        if extra_info and isinstance(extra_info, dict):
+                            question = extra_info.get('question', '')
+                    
+                    # 构造强制回答的响应 - 使用新的 JSON 格式
+                    # 告诉模型必须基于已有信息回答
+                    forced_answer = f'{{"think": "I have searched {self._search_counters[idx]} times and must now provide my best answer based on the information gathered.", "action": "answer", "arguments": {{}}, "answer": "Based on the retrieved images, I could not find the specific information requested. Please provide more context or try a different query."}}' + self.tokenizer.eos_token
+                    forced_answer_responses_str[idx] = forced_answer
+                    has_forced_answer = True
+                    print(f"  [FORCE ANSWER] Sample {idx}: Forcing answer due to search limit")
+            
+            if has_forced_answer:
+                responses_str = forced_answer_responses_str
+                responses_ids = self._batch_tokenize(responses_str)
+                # 重新解析动作
+                cur_actions_debug, contents_debug = self.postprocess_predictions(responses_str)
+            # === END 搜索次数限制 ===
             
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
             # Execute in environment and process observations
@@ -948,53 +1313,73 @@ class LLMGenerationManager:
                 next_obs_ids
             )# 更新滚动上下文（用于下一轮生成）
             
-            # === DEBUG: 打印当前上下文摘要（只打印第一个样本）===
-            if step < 3 or step == self.config.max_turns - 1:  # 只打印前3轮和最后一轮
-                print(f"\n[CONTEXT SUMMARY] Step {step + 1} - Sample 0:")
-                # 解码当前上下文
-                sample_0_ids = rollings.batch['input_ids'][0]
-                sample_0_mask = rollings.batch['attention_mask'][0]
-                valid_ids = sample_0_ids[sample_0_mask == 1]
-                context_text = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
-                # 统计 image_id 出现次数
-                import re as re_module
-                image_ids_in_context = re_module.findall(r'image_(\d+)', context_text)
-                print(f"  Context length (tokens): {len(valid_ids)}")
-                print(f"  Image IDs found in context: {sorted(set(image_ids_in_context))}")
-                print(f"  Number of images in multi_modal_data: {len(rollings.non_tensor_batch.get('multi_modal_data', [{}])[0].get('image', []))}")
+            # === DEBUG: 打印当前上下文摘要（只在最后一个 step 打印所有样本）===
+            if step == self.config.max_turns - 1:  # 只在最后一轮打印
+                batch_size = rollings.batch['input_ids'].shape[0]
+                print(f"\n{'='*80}")
+                print(f"[FINAL CONTEXT SUMMARY] Step {step + 1} (Last Step) - All {batch_size} samples")
+                print(f"{'='*80}")
                 
-                # 统计 vision_start 和 vision_end 的数量
-                vision_start_count = context_text.count('<|vision_start|>')
-                vision_end_count = context_text.count('<|vision_end|>')
-                print(f"  <|vision_start|> count: {vision_start_count}")
-                print(f"  <|vision_end|> count: {vision_end_count}")
+                for sample_idx in range(batch_size):
+                    print(f"\n[SAMPLE {sample_idx}] {'='*60}")
+                    
+                    # 解码当前上下文
+                    sample_ids = rollings.batch['input_ids'][sample_idx]
+                    sample_mask = rollings.batch['attention_mask'][sample_idx]
+                    valid_ids = sample_ids[sample_mask == 1]
+                    context_text = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
+                    
+                    # 统计 image_id 出现次数
+                    import re as re_module
+                    image_ids_in_context = re_module.findall(r'image_(\d+)', context_text)
+                    print(f"  Context length (tokens): {len(valid_ids)}")
+                    print(f"  Image IDs found in context: {sorted(set(image_ids_in_context))}")
+                    
+                    # 获取多模态数据中的图片数量
+                    mm_data = rollings.non_tensor_batch.get('multi_modal_data', [])
+                    if sample_idx < len(mm_data) and mm_data[sample_idx]:
+                        num_images = len(mm_data[sample_idx].get('image', []))
+                    else:
+                        num_images = 0
+                    print(f"  Number of images in multi_modal_data: {num_images}")
+                    
+                    # 统计 vision_start 和 vision_end 的数量
+                    vision_start_count = context_text.count('<|vision_start|>')
+                    vision_end_count = context_text.count('<|vision_end|>')
+                    print(f"  <|vision_start|> count: {vision_start_count}")
+                    print(f"  <|vision_end|> count: {vision_end_count}")
+                    
+                    # === 关键检查：问题是否在上下文中 ===
+                    # 检查 "## Question" 标记是否存在
+                    has_question_marker = '## Question' in context_text
+                    # 从 extra_info 获取原始问题
+                    original_question = ""
+                    if 'extra_info' in rollings.non_tensor_batch and sample_idx < len(rollings.non_tensor_batch['extra_info']):
+                        extra_info = rollings.non_tensor_batch['extra_info'][sample_idx]
+                        if extra_info and isinstance(extra_info, dict):
+                            original_question = extra_info.get('question', '')[:100]
+                    
+                    # 检查问题内容是否在上下文中（取前50个字符匹配）
+                    question_in_context = original_question[:50] in context_text if original_question else False
+                    
+                    print(f"  [QUESTION CHECK] '## Question' marker present: {has_question_marker}")
+                    print(f"  [QUESTION CHECK] Original question (first 100 chars): {original_question}")
+                    print(f"  [QUESTION CHECK] Question content in context: {question_in_context}")
+                    
+                    if not has_question_marker or not question_in_context:
+                        print(f"  [WARNING] ⚠️ QUESTION MAY BE TRUNCATED FROM CONTEXT! ⚠️")
+                        print(f"  [WARNING] This could cause the model to search indefinitely without knowing what to answer.")
+                    # === END 关键检查 ===
+                    
+                    # 打印上下文的完整内容（去掉 image token）
+                    context_preview = context_text.replace(self.processor.image_token, '[IMG]')
+                    print(f"\n  ============================== 上下文窗口开始 (Sample {sample_idx}) ==============================")
+                    print(f"  {context_preview}")
+                    print(f"  ============================== 上下文窗口结束 (Sample {sample_idx}) ==============================")
                 
-                # === 关键检查：问题是否在上下文中 ===
-                # 检查 "## Question" 标记是否存在
-                has_question_marker = '## Question' in context_text
-                # 从 extra_info 获取原始问题
-                original_question = ""
-                if 'extra_info' in rollings.non_tensor_batch and len(rollings.non_tensor_batch['extra_info']) > 0:
-                    extra_info = rollings.non_tensor_batch['extra_info'][0]
-                    if extra_info and isinstance(extra_info, dict):
-                        original_question = extra_info.get('question', '')[:100]
-                
-                # 检查问题内容是否在上下文中（取前50个字符匹配）
-                question_in_context = original_question[:50] in context_text if original_question else False
-                
-                print(f"  [QUESTION CHECK] '## Question' marker present: {has_question_marker}")
-                print(f"  [QUESTION CHECK] Original question (first 100 chars): {original_question}")
-                print(f"  [QUESTION CHECK] Question content in context: {question_in_context}")
-                
-                if not has_question_marker or not question_in_context:
-                    print(f"  [WARNING] ⚠️ QUESTION MAY BE TRUNCATED FROM CONTEXT! ⚠️")
-                    print(f"  [WARNING] This could cause the model to search indefinitely without knowing what to answer.")
-                # === END 关键检查 ===
-                
-                # 打印上下文的前500和后500字符（去掉 image token）
-                context_preview = context_text.replace(self.processor.image_token, '[IMG]')
-                print(f"  Context start: {context_preview[:3500]}...")
-                print(f"  Context end: ...{context_preview[-9500:]}")
+                print(f"\n{'='*80}")
+                print(f"[END FINAL CONTEXT SUMMARY]")
+                print(f"{'='*80}\n")
             # === END DEBUG ===
             
             original_right_side = self._update_right_side(
@@ -1342,7 +1727,7 @@ class LLMGenerationManager:
                             raise ValueError("Invalid region value")
                     except Exception as e:
                         print(f"[CROP ERROR] {e}")
-                        next_obs.append('\n<|im_start|>user\nYour previous crop action is invalid. Please use the correct format: <tools_call>{"type": "crop", "arguments": {"image_id": "image_01", "region": [x1, y1, x2, y2]}}</tools_call>. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
+                        next_obs.append('\n<|im_start|>user\nYour crop action failed. Please use the correct JSON format:\n\n{"think": "I need to zoom in on...", "action": "crop", "arguments": {"image_id": "image_01", "region": [x1, y1, x2, y2]}, "answer": null}\n\nPlease try again.\n<|im_end|>\n<|im_start|>assistant\n')
                     dones.append(0)
                 elif action == 'ocr':
                     # OCR 动作 → 提取图片中的文本
@@ -1365,11 +1750,11 @@ class LLMGenerationManager:
                             raise ValueError("Invalid region value")
                     except Exception as e:
                         print(f"[OCR ERROR] {e}")
-                        next_obs.append('\n<|im_start|>user\nYour previous OCR action is invalid. Please use the correct format: <tools_call>{"type": "ocr", "arguments": {"image_id": "image_01", "region": [x1, y1, x2, y2]}}</tools_call>. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
+                        next_obs.append('\n<|im_start|>user\nYour OCR action failed. Please use the correct JSON format:\n\n{"think": "I need to extract text from...", "action": "ocr", "arguments": {"image_id": "image_01", "region": [x1, y1, x2, y2]}, "answer": null}\n\nPlease try again.\n<|im_end|>\n<|im_start|>assistant\n')
                     dones.append(0)
                 else:
                     # 无效动作 → 返回错误提示
-                    next_obs.append('\n<|im_start|>user\nYour previous action is invalid. You must conduct reasoning inside <think> and </think> first every time you get new information. After reasoning, if you want to search, you should put the query between <search> and </search>.\nIf you find no further external knowledge needed, you can directly provide the answer inside <answer> and </answer>, without detailed illustrations. For example, <answer> Beijing </answer>. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
+                    next_obs.append('\n<|im_start|>user\nSTOP! Your output format is WRONG. Do NOT output natural language text.\n\nYou MUST output ONLY a JSON object like this:\n\n{"think": "brief reasoning", "action": "search", "arguments": {"query": "your query"}, "answer": null}\n\nOR for final answer:\n\n{"think": "brief reasoning", "action": "answer", "arguments": {}, "answer": "your answer"}\n\nOutput ONLY the JSON object, nothing else.\n<|im_end|>\n<|im_start|>assistant\n')
                     dones.append(0)
             
         assert len(search_results) == 0
@@ -1378,83 +1763,110 @@ class LLMGenerationManager:
     #解析调用工具
     def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
         """
-        Process (text-based) predictions from llm into actions and validity flags.
+        Process (text-based) predictions from llm into actions.
+        
+        Expected JSON format:
+        {"think": "...", "action": "search|crop|ocr|answer", "arguments": {...}, "answer": null|"..."}
         
         Args:
             predictions: List of raw predictions
             
         Returns:
-            Tuple of (actions list, validity flags list)
+            Tuple of (actions list, contents list)
         """
         actions = []
         contents = []
+        
+        VALID_ACTIONS = {'search', 'crop', 'ocr', 'answer'}
+        
+        def parse_json_format(text):
+            """Parse JSON format: {"think": "...", "action": "...", "arguments": {...}, "answer": ...}
+            
+            处理特殊情况：
+            1. 模型可能输出 <think>...</think> 标签包裹的内容
+            2. 可能有多个 JSON 对象，需要找到第一个有效的
+            """
+            import re as re_module
+            
+            # 首先尝试移除 <think>...</think> 标签内的内容
+            # 因为 Qwen3-VL-Thinking 模型可能会在 <think> 标签内输出无效的 JSON
+            text_without_think = re_module.sub(r'<think>.*?</think>', '', text, flags=re_module.DOTALL)
+            
+            # 如果移除后还有内容，优先解析移除后的内容
+            texts_to_try = [text_without_think, text] if text_without_think.strip() else [text]
+            
+            for try_text in texts_to_try:
+                # 找到所有可能的 JSON 对象起始位置
+                start_positions = [i for i, c in enumerate(try_text) if c == '{']
+                
+                for start_idx in start_positions:
+                    try:
+                        # 使用括号匹配找到对应的 }
+                        brace_count = 0
+                        end_idx = -1
+                        for i in range(start_idx, len(try_text)):
+                            if try_text[i] == '{':
+                                brace_count += 1
+                            elif try_text[i] == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end_idx = i
+                                    break
+                        
+                        if end_idx == -1:
+                            continue
+                        
+                        json_str = try_text[start_idx:end_idx + 1]
+                        parsed = json.loads(json_str)
+                        
+                        # 验证必需字段
+                        required_fields = ['think', 'action', 'arguments', 'answer']
+                        if not all(key in parsed for key in required_fields):
+                            continue
+                        
+                        action = parsed.get('action', '')
+                        if action not in VALID_ACTIONS:
+                            continue
+                        
+                        # 根据 action 类型提取 content
+                        if action == 'search':
+                            content = parsed.get('arguments', {}).get('query', '')
+                        elif action == 'crop':
+                            content = parsed.get('arguments', {})
+                        elif action == 'ocr':
+                            content = parsed.get('arguments', {})
+                        elif action == 'answer':
+                            content = parsed.get('answer', '')
+                        else:
+                            continue
+                        
+                        return action, content
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        continue
+            
+            return None, None
                 
         for idx, prediction in enumerate(predictions):
-            if isinstance(prediction, str): # for llm output
-                # === DEBUG: 打印原始预测内容 ===
-                if idx == 0:  # 只打印第一个样本的详细信息
+            if isinstance(prediction, str):
+                # DEBUG: 打印原始预测内容
+                if idx == 0:
                     print(f"\n[PARSE DEBUG] Sample {idx} raw prediction (first 500 chars):")
                     print(f"  {prediction[:500]}")
-                # === END DEBUG ===
                 
-                # 首先尝试匹配新的 <tools_call> 格式
-                tools_call_pattern = r'<tools_call>(.*?)</tools_call>'
-                tools_call_match = re.search(tools_call_pattern, prediction, re.DOTALL)
+                action, content = parse_json_format(prediction)
                 
-                if tools_call_match:
-                    try:
-                        tools_call_content = tools_call_match.group(1).strip()
-                        if idx == 0:
-                            print(f"  [PARSE DEBUG] Found <tools_call>: {tools_call_content[:200]}")
-                        tools_call_json = json.loads(tools_call_content)
-                        tool_type = tools_call_json.get('type', '')
-                        
-                        if tool_type == 'crop':
-                            # crop 格式: {"type": "crop", "arguments": {"image_id": "image_01", "region": [x1, y1, x2, y2]}}
-                            action = 'crop'
-                            content = tools_call_json.get('arguments', {})
-                        elif tool_type == 'ocr':
-                            # ocr 格式: {"type": "ocr", "arguments": {"image_id": "image_01", "region": [x1, y1, x2, y2]}}
-                            action = 'ocr'
-                            content = tools_call_json.get('arguments', {})
-                        elif tool_type == 'search':
-                            # search 格式: {"type": "search", "arguments": {"query": "..."}}
-                            action = 'search'
-                            content = tools_call_json.get('arguments', {}).get('query', '')
-                        else:
-                            action = None
-                            content = ''
-                        if idx == 0:
-                            print(f"  [PARSE DEBUG] Parsed action: {action}, content: {str(content)[:100]}")
-                    except json.JSONDecodeError as e:
-                        if idx == 0:
-                            print(f"  [PARSE DEBUG] JSON decode error: {e}")
-                        action = None
-                        content = ''
+                if action is not None:
+                    if idx == 0:
+                        print(f"  [PARSE DEBUG] Parsed JSON - action: {action}, content: {str(content)[:100]}")
                 else:
-                    # 回退到标签格式 (search, answer)
-                    pattern = r'<(search|answer)>(.*?)</\1>'
-                    match = re.search(pattern, prediction, re.DOTALL)
-                    if match:
-                        content = match.group(2).strip()  # Return only the content inside the tags
-                        action = match.group(1)
-                        if idx == 0:
-                            print(f"  [PARSE DEBUG] Found legacy tag <{action}>: {content[:100]}")
-                    else:
-                        content = ''
-                        action = None
-                        if idx == 0:
-                            # 检查是否有部分匹配
-                            has_tools_call_open = '<tools_call>' in prediction
-                            has_tools_call_close = '</tools_call>' in prediction
-                            has_search_open = '<search>' in prediction
-                            has_search_close = '</search>' in prediction
-                            has_answer_open = '<answer>' in prediction
-                            has_answer_close = '</answer>' in prediction
-                            print(f"  [PARSE DEBUG] No valid action found!")
-                            print(f"    <tools_call> open: {has_tools_call_open}, close: {has_tools_call_close}")
-                            print(f"    <search> open: {has_search_open}, close: {has_search_close}")
-                            print(f"    <answer> open: {has_answer_open}, close: {has_answer_close}")
+                    if idx == 0:
+                        # 诊断为什么解析失败
+                        has_brace = '{' in prediction
+                        has_action = '"action"' in prediction
+                        has_think = '"think"' in prediction
+                        print(f"  [PARSE DEBUG] No valid JSON action found!")
+                        print(f"    has_brace={has_brace}, has_action={has_action}, has_think={has_think}")
+                    content = ''
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
             

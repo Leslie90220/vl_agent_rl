@@ -44,17 +44,36 @@ class SingleTurnAgentLoop(AgentLoopBase):
         metrics = {}
         request_id = uuid4().hex
         
-        # Store multi_modal_inputs computed during prompt generation
-        # This ensures image_grid_thw matches the expanded image tokens in prompt_ids
+        # Store computed multi_modal_inputs for postprocessing
         computed_multi_modal_inputs = None
+        # Flag to indicate if we're using collapsed prompt_ids
+        using_collapsed_prompt_ids = False
 
-        # Check if we have multimodal data
-        has_multimodal = image_data is not None and (len(image_data) > 0 if isinstance(image_data, list) else True)
+        # CRITICAL FIX: For multimodal inputs with vLLM async mode
+        # 
+        # In VRAG training, raw_prompt (message list) may not be updated across turns,
+        # but multi_modal_data is accumulated. This causes a mismatch:
+        # - raw_prompt may have 1 image placeholder
+        # - multi_modal_data may have 2+ images
+        # 
+        # Solution: Use raw_prompt_ids (pre-computed token IDs with collapsed image tokens)
+        # for vLLM generation. Mark that we're using collapsed prompt_ids so postprocessing
+        # can handle position_ids calculation correctly.
+        #
+        # The flow is:
+        # 1. Use raw_prompt_ids for vLLM generation (collapsed image tokens)
+        # 2. Pass image_data to vLLM
+        # 3. vLLM will expand tokens based on actual image data
+        # 4. For postprocessing, skip get_rope_index since prompt_ids are collapsed
         
-        # For multimodal inputs, we need to use the processor to get prompt_ids with
-        # correctly expanded image tokens that match the image_grid_thw
-        if has_multimodal and self.processor is not None:
-            # Use processor to get prompt_ids with expanded image tokens
+        # Check if raw_prompt_ids is available (from VRAG training loop)
+        if "raw_prompt_ids" in kwargs and kwargs["raw_prompt_ids"] is not None:
+            # Use pre-computed raw_prompt_ids for vLLM generation (collapsed image tokens)
+            prompt_ids = list(kwargs["raw_prompt_ids"])
+            using_collapsed_prompt_ids = True
+        elif self.processor is not None and image_data is not None:
+            # Fallback: Use processor to get prompt_ids with expanded image tokens
+            # This path is used when raw_prompt_ids is not available
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
@@ -64,17 +83,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
-            prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
-            
-            # Remove attention_mask as we'll compute it later based on padding
-            model_inputs.pop("attention_mask", None)
-            
-            # Store the multi_modal_inputs (pixel_values, image_grid_thw, etc.)
-            # This ensures the image_grid_thw matches the expanded tokens in prompt_ids
-            computed_multi_modal_inputs = dict(model_inputs)
+            # processor() will expand image tokens based on image dimensions
+            # _qwen2_5_vl_dedup_image_tokens in vLLM will collapse them back
+            model_inputs = await self.loop.run_in_executor(
+                None,
+                lambda: self.processor(text=[raw_prompt], images=image_data, return_tensors="pt"),
+            )
+            prompt_ids = model_inputs["input_ids"].squeeze(0).tolist()
+            # Store multi_modal_inputs for postprocessing
+            computed_multi_modal_inputs = {k: v for k, v in model_inputs.items() if k not in ["input_ids", "attention_mask"]}
         elif self.processor is not None:
-            # Non-multimodal but has processor
+            # Text-only with processor
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
@@ -84,8 +103,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            model_inputs = self.processor(text=[raw_prompt], images=None, return_tensors="pt")
-            prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+            prompt_ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.encode(raw_prompt, add_special_tokens=False),
+            )
         else:
             # Text-only with tokenizer
             prompt_ids = await self.loop.run_in_executor(
@@ -96,25 +117,23 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
 
         with simple_timer("generate_sequences", metrics):
-            # CRITICAL: When prompt_ids already has expanded image tokens (from processor),
-            # we should NOT pass image_data to vLLM. vLLM's _qwen2_5_vl_dedup_image_tokens
-            # will collapse the expanded tokens, and then vLLM will re-expand them based on
-            # image_data. However, this can cause mismatches if the image processing differs.
-            # 
-            # When computed_multi_modal_inputs is set, it means we used the processor to
-            # expand image tokens in prompt_ids, so we should NOT pass image_data to vLLM.
-            # The multi_modal_inputs (pixel_values, image_grid_thw) will be used later in
-            # postprocess for position_ids calculation.
-            image_data_for_vllm = None if computed_multi_modal_inputs is not None else image_data
+            # ALWAYS pass image_data to vLLM when we have multimodal data
+            # vLLM will:
+            # 1. Call _qwen2_5_vl_dedup_image_tokens to collapse any remaining expanded tokens
+            # 2. Process image_data to get pixel_values
+            # 3. Re-expand tokens based on actual image dimensions
             output = await self.server_manager.generate(
-                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data_for_vllm
+                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
             )
+        
         response_mask = [1] * len(output.token_ids)
 
-        # Build extra_fields to pass computed_multi_modal_inputs to postprocess
+        # Build extra_fields
         extra_fields = {}
-        if computed_multi_modal_inputs is not None:
+        if computed_multi_modal_inputs:
             extra_fields["computed_multi_modal_inputs"] = computed_multi_modal_inputs
+        if using_collapsed_prompt_ids:
+            extra_fields["using_collapsed_prompt_ids"] = True
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,

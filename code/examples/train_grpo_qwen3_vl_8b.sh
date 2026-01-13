@@ -76,7 +76,7 @@ python3 "${CODE_DIR}/verl/verl/trainer/main_ppo_vrag.py" \
     data.val_files=/vepfs_c/zhaowenxuan/workspace/vldoc_agent_rl/code/data/mmlongdoc_test.parquet \
     data.train_batch_size=$train_batch_size \
     data.max_prompt_length=28672 \
-    data.max_response_length=4096 \
+    data.max_response_length=16384 \
     data.image_key=images \
     data.return_raw_chat=True \
     actor_rollout_ref.model.path=$model_path \
@@ -102,6 +102,7 @@ python3 "${CODE_DIR}/verl/verl/trainer/main_ppo_vrag.py" \
     actor_rollout_ref.rollout.top_p=0.9 \
     actor_rollout_ref.rollout.gpu_memory_utilization=$GPU_MEMORY_UTILIZATION \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.max_model_len=65536 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.n=1 \

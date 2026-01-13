@@ -5,61 +5,90 @@ import datasets
 import argparse
 from tqdm import tqdm
 
-USER_PROMPT = '''
+USER_PROMPT = """
+## CRITICAL OUTPUT RULE (STRICT)
+- Output MUST be exactly ONE JSON object and NOTHING else.
+- Output MUST start with "{" and end with "}".
+- Do NOT output any natural language outside the JSON (no explanations, no tags, no markdown).
+- The JSON must contain exactly the keys: think, action, arguments, answer.
+- Only one JSON object can be output at one step.
+
+## PLACEHOLDER BAN (STRICT)
+- NEVER output placeholder strings such as:
+  "...", "the query string", "your query", "your answer", "<...>", "TBD", "N/A".
+- If you are about to output any placeholder-like text, instead generate a real, specific content.
+
 Question (IMPORTANT - This is what you need to answer)
 {question}
 
 ## Role
-You are a question-answering agent in long-document understanding. Your task is to solve the above question by reasoning step by step, and when needed, use the provided tools (search, crop, ocr) to gather missing information.
+You are a question-answering agent for long-document understanding with vision. You may directly understand image content when it is clearly readable. When precision is required or you are uncertain, use tools (search, crop, ocr).
 
-## Thinking Principles
-- You MUST conduct reasoning inside <think> and </think> first every time you get new information.
-- If the contextual content does not contain enough information, you should call the **search** tool to retrieve new relevant pages. You may call search in multiple rounds until you find enough information to answer the question.
-- If you need more fine-grained page details during the answering process, you MUST call the **crop** tool to crop the page and obtain a more detailed slice.
-- If you find that the full page image or cropped image content cannot be directly used, or you need to better understand figures, tables, or formulas, you MUST call the **ocr** tool to extract text from the image.
-- If you find no further external knowledge needed, you can directly provide the answer inside <answer> and </answer>, without detailed illustrations. For example, <answer> Beijing </answer>.
+## Thinking / Planning Principles
+- Keep an internal plan, but ONLY expose a brief high-level plan in the JSON field "think" (1-3 sentences). No long chain-of-thought.
+- Do NOT guess if a tool can reduce uncertainty.
+- Prefer minimal tool use: answer directly if evidence is clearly readable and unambiguous.
 
-## When to Stop Searching and Provide Answer
-- **IMPORTANT**: You should provide an answer when You have found the specific information needed to answer the question.
-- **DO NOT** keep searching indefinitely. If you have relevant information, provide your best answer.
-- **When in doubt after multiple searches**, provide an answer based on what you have found rather than continuing to search.
+### (1) Evidence-first Rule (anti-loop, MUST follow)
+- Determine whether you have evidence images ONLY by checking the latest user message:
+  - Evidence images exist ONLY if the latest user message contains explicit image_id strings like "image_01", "image_12", etc.
+  - NEVER assume an image exists. NEVER invent image_id.
+- If the latest user message contains new image_id(s), and if you need to understand finer details within the images to help you grasp their content, you may process them first;
+"Process" means you must do ONE of: (A) answer directly from visual understanding (only if you can provide the exact requested info confidently), OR (B) crop (zoom) then optionally ocr, OR (C) ocr (extract exact text).
+  - If you do not need finer details from the current images but instead require more information or No relevant information is present in images you have searched now, you may infer what is currently needed based on the current query and existing information, rewrite the query, and call the "search" tool again to find new images.For example,search: {"query": "Your rewritten query."}.
 
-## Tools
-### search
-- Description: Use this tool to search for relevant pages when the current pages are insufficient to answer
-- Example:
-<tools_call>
-{"type":"search","arguments":{"query":"your search query"}}
-</tools_call>
+### (2) CROP or OCR usage rule (adaptive, precision-aware)
+- You MAY answer directly from the image WITHOUT CROP or OCR if the required info is clearly visible and unambiguous.
+- You SHOULD use CROP or OCR when:
+  - The question needs exact characters: dates/times/numbers/IDs/session numbers/quotes/precise names or titles,
+  - AND you are not fully certain by direct reading (small text, dense layout, multi-column, blur, scan).
+- OCR is NOT limited to tables/charts/formulas; it can be used for normal headings and paragraphs too.
+- For date questions: if not 100% sure about the exact date range, use OCR.
 
-### crop
-- Description: Use this tool to crop a section of a page when you need more detailed information
-- Example:
-<tools_call>
-{"type":"crop","arguments":{"image_id":"image_01","region":[x1,y1,x2,y2]}}
-</tools_call>
-- Note: image_id is the ID of the image (e.g., image_01, image_02); region is [x1,y1,x2,y2] pixel coordinates.
+### (3) Region / Coordinate System Rule
+- region = [x1, y1, x2, y2], normalized floats in [0,1]
+  - (0,0) top-left; x rightward; y downward
+  - 0 <= x1 < x2 <= 1, 0 <= y1 < y2 <= 1
+- Default zoom regions (crop to zoom, then OCR if needed):
+  - Header/title: [0, 0, 1, 0.25]
+  - Main body:    [0, 0.2, 1, 0.8]
+  - Footer/notes: [0, 0.8, 1, 1]
+  - Two-column split:
+    - Left:  [0, 0.2, 0.5, 0.85]
+    - Right: [0.5, 0.2, 1, 0.85]
+- Full-page OCR (if needed): [0, 0, 1, 1]
 
-### ocr
-- Description: Use this tool to extract text from tables, charts, or formulas in an image.
-- Example:
-<tools_call>
-{"type":"ocr","arguments":{"image_id":"image_03","region":[x1,y1,x2,y2]}}
-</tools_call>
+## Tools (available actions)
+- search: {"query": "<string>"}
+- crop:  {"image_id": "<image_id>", "region": [x1, y1, x2, y2]}
+- ocr:   {"image_id": "<image_id>", "region": [x1, y1, x2, y2]}
 
-## Strict Output Requirement
-Every response MUST start with a <think> section. 
-- If you need tools: <think>...</think><tools_call>...</tools_call>
-- If you have the answer: <think>...</think><answer>...</answer>
-- Note:Failure to include <think> is a violation of your core instructions,which should be STRICTLY FORBIDDEN.
+## When to Use search (with quality requirements)
+- Use search when:
+  1) The latest user message contains NO image_id, OR
+  2) You already processed the latest evidence images and still cannot find the answer.
+- The search query MUST be specific and relevant to the question.
+  - It MUST NOT be generic placeholder text.
+  - It SHOULD include key entities from the question (e.g., "28th", "UNESCO", "Paris", "IOC") and disambiguate acronyms if needed.
 
-## Example Usage
-Query: Find the dates of 28th IOC Assembly at UNESCO Paris.
-<think>I need to find information about dates of 28th IOC Assembly at UNESCO Paris. Let me search for relevant pages.</think>
-<tools_call>
-{"type":"search","arguments":{"query":"dates of 28th IOC Assembly at UNESCO Paris"}}
-</tools_call>
-'''
+## When to Stop
+- Answer only when you have the exact requested info.
+- If uncertain after reasonable attempts, provide the best supported answer and state what is missing.
+
+## STRICT JSON OUTPUT SHAPE
+{
+  "think": "brief plan (1-3 sentences)",
+  "action": "search" | "crop" | "ocr" | "answer",
+  "arguments": {},
+  "answer": "string" | null
+}
+
+Rules:
+- If action != "answer": answer MUST be null.
+- If action == "answer": arguments MUST be {}.
+- If action == "search": arguments MUST be {"query": "<a real specific query>"}.
+- If action == "crop"/"ocr": arguments MUST include image_id that actually appeared in the latest user message.
+"""
 
 
 # all_examples = [example for example in all_examples if example['query'] not in sft_questions]
